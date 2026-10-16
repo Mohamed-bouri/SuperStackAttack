@@ -251,8 +251,100 @@ def truncate_label(text, draw, font, max_width):
     return measured
 
 
+def make_rows_for_width(image_specs, target_width, gap, label_height, padding):
+    """Pack images into natural-order rows without resizing any source image."""
+    rows = []
+    row = []
+    row_width = 0
+    row_height = 0
+
+    for spec in image_specs:
+        width, height = spec["size"]
+        tile_height = height + label_height
+        proposed_width = width if not row else row_width + gap + width
+
+        if row and proposed_width > target_width:
+            rows.append({"items": row, "width": row_width, "height": row_height})
+            row = []
+            row_width = 0
+            row_height = 0
+            proposed_width = width
+
+        if row:
+            row_width += gap + width
+        else:
+            row_width = width
+
+        row.append(spec)
+        row_height = max(row_height, tile_height)
+
+    if row:
+        rows.append({"items": row, "width": row_width, "height": row_height})
+
+    canvas_width = max((row_info["width"] for row_info in rows), default=0) + 2 * padding
+    canvas_height = (
+        sum(row_info["height"] for row_info in rows)
+        + max(0, len(rows) - 1) * gap
+        + 2 * padding
+    )
+    return rows, (canvas_width, canvas_height)
+
+
+def choose_compact_layout(image_specs, gap, padding, label_height):
+    """Choose a compact layout whose canvas is as close to square as practical."""
+    max_width = max(spec["size"][0] for spec in image_specs)
+    total_width = sum(spec["size"][0] for spec in image_specs) + gap * max(0, len(image_specs) - 1)
+    occupied_area = sum(
+        width * (height + label_height)
+        for spec in image_specs
+        for width, height in [spec["size"]]
+    )
+
+    # Try a range of target widths. Image dimensions are never changed; only row
+    # breaks change. Candidate widths are capped to avoid wasteful layouts.
+    ideal = max(1, int(math.sqrt(occupied_area)))
+    lower = max_width
+    upper = min(total_width, max(max_width, int(ideal * 2.25)))
+    if upper < lower:
+        upper = lower
+
+    candidate_widths = {lower, upper}
+    samples = 180
+    if upper > lower:
+        for index in range(samples + 1):
+            candidate_widths.add(
+                round(lower + (upper - lower) * index / samples)
+            )
+
+    # Include likely near-square widths explicitly, reducing sensitivity to the
+    # sampling interval for common sprite sizes.
+    for multiplier in (0.60, 0.70, 0.80, 0.90, 1.00, 1.10, 1.25, 1.40, 1.60, 1.85, 2.10, 2.25):
+        candidate_widths.add(max(lower, min(upper, int(ideal * multiplier))))
+
+    best = None
+    for target_width in sorted(candidate_widths):
+        rows, canvas_size = make_rows_for_width(
+            image_specs, target_width, gap, label_height, padding
+        )
+        canvas_width, canvas_height = canvas_size
+        pixel_count = canvas_width * canvas_height
+        if canvas_width <= 0 or canvas_height <= 0 or pixel_count > MAX_PIXELS:
+            continue
+
+        aspect_penalty = abs(math.log(canvas_width / canvas_height))
+        occupied_ratio = min(1.0, occupied_area / pixel_count)
+        empty_ratio = 1.0 - occupied_ratio
+        # Prefer near-square sheets but avoid layouts that achieve this by
+        # creating an excessive amount of unused canvas.
+        score = aspect_penalty + 0.22 * empty_ratio
+        if best is None or score < best[0]:
+            best = (score, rows, canvas_size, target_width)
+
+    return best
+
+
 def create_contact_sheet():
-    """Arrange PNG files into one square, labeled contact sheet."""
+    """Combine PNGs at native dimensions into one compact, near-square sheet."""
     raw_folder = input("\nEnter the folder containing PNG files: ").strip().strip('"').strip("'")
     if not raw_folder:
         print("Error: No folder entered.")
@@ -264,138 +356,177 @@ def create_contact_sheet():
         return
 
     recursive_choice = ask_choice(
-        "Include PNGs in subfolders? (y/N): ", {"y": "yes", "Y": "yes", "n": "no", "N": "no", "": "no"}, default="n"
+        "Include PNGs in subfolders? (y/N): ",
+        {"y": "yes", "Y": "yes", "n": "no", "N": "no", "": "no"},
+        default="n",
     )
     recursive = recursive_choice.lower() == "y"
-
-    if recursive:
-        candidates = folder.rglob("*")
-    else:
-        candidates = folder.iterdir()
+    candidates = folder.rglob("*") if recursive else folder.iterdir()
 
     png_paths = []
     for path in candidates:
         if not path.is_file() or path.suffix.lower() != ".png":
             continue
-        # Exclude this tool's own contact-sheet outputs on later runs.
+        # Prevent the output from being added as an input on later runs.
         if re.match(r"^(png_)?contact_sheet(?:_\d+)?$", path.stem, re.IGNORECASE):
             continue
         png_paths.append(path)
 
     png_paths.sort(key=lambda p: natural_sort_key(p.relative_to(folder).as_posix()))
     if not png_paths:
-        print("No PNG files found in the selected folder (after excluding previous contact sheets).")
+        print("No PNG files found (excluding previously generated contact sheets).")
         return
 
-    print(f"Found {len(png_paths)} PNG file(s).")
-    cell_size = ask_positive_int("Square cell size in pixels [256]: ", MAX_CELL_SIZE, default=256)
-    if cell_size < 96:
-        print("Cell size below 96 can make labels and thumbnails hard to inspect; continuing anyway.")
-
-    labels_choice = ask_choice(
-        "Add filename labels? (Y/n): ", {"y": "yes", "Y": "yes", "n": "no", "N": "no", "": "yes"}, default="y"
-    )
-    show_labels = labels_choice.lower() != "n"
-
-    print("\nBackground:")
-    print("1. Light gray (recommended)")
-    print("2. White")
-    print("3. Dark gray")
-    print("4. Transparent")
-    bg_choice = ask_choice("Select background [1]: ", {"1": "light", "2": "white", "3": "dark", "4": "transparent"}, default="1")
-    backgrounds = {
-        "1": (242, 242, 242),
-        "2": (255, 255, 255),
-        "3": (48, 48, 48),
-    }
-    bg_color = backgrounds.get(bg_choice)
-    transparent_sheet = bg_choice == "4"
-
-    count = len(png_paths)
-    grid_side = math.ceil(math.sqrt(count))
-    gap = max(8, round(cell_size * 0.04))
-    padding = gap
-    sheet_side = padding * 2 + grid_side * cell_size + (grid_side - 1) * gap
-    if sheet_side * sheet_side > MAX_PIXELS:
-        print(
-            f"Error: The contact sheet would be {sheet_side} x {sheet_side} "
-            f"({sheet_side * sheet_side:,} pixels), exceeding the safety limit. "
-            "Use a smaller cell size or fewer files."
-        )
-        return
-
-    if transparent_sheet:
-        sheet = Image.new("RGBA", (sheet_side, sheet_side), (0, 0, 0, 0))
-        label_band = (245, 245, 245, 235)
-        label_ink = (20, 20, 20, 255)
-        border = (150, 150, 150, 255)
-    else:
-        sheet = Image.new("RGB", (sheet_side, sheet_side), bg_color)
-        if bg_choice == "3":
-            label_band, label_ink, border = (65, 65, 65), (255, 255, 255), (125, 125, 125)
-        else:
-            label_band, label_ink, border = (225, 225, 225), (25, 25, 25), (175, 175, 175)
-
-    draw = ImageDraw.Draw(sheet)
-    font_size = max(10, min(24, cell_size // 16))
-    font = load_font(font_size)
-    label_height = max(24, font_size + 10) if show_labels else 0
-    image_margin = max(6, round(cell_size * 0.04))
-    image_box = (
-        max(1, cell_size - image_margin * 2),
-        max(1, cell_size - image_margin * 2 - label_height),
-    )
-
+    print(f"Found {len(png_paths)} PNG file(s). Reading their original dimensions...")
+    image_specs = []
     skipped = []
-    placed = 0
-    for index, path in enumerate(png_paths, start=1):
+    total_source_pixels = 0
+
+    # Validate each file and record dimensions. No thumbnails or resizing are used.
+    for path in png_paths:
         try:
             with Image.open(path) as source:
                 source.seek(0)
-                asset = ImageOps.exif_transpose(source).convert("RGBA")
-                asset.load()
-            if asset.width * asset.height > MAX_PIXELS:
-                skipped.append((path, "image exceeds pixel safety limit"))
-                continue
-
-            thumbnail = ImageOps.contain(asset, image_box, method=Image.Resampling.LANCZOS)
-            col = (index - 1) % grid_side
-            row = (index - 1) // grid_side
-            x = padding + col * (cell_size + gap)
-            y = padding + row * (cell_size + gap)
-
-            # Center thumbnail without stretching or discarding its alpha channel.
-            tx = x + (cell_size - thumbnail.width) // 2
-            ty = y + (image_box[1] - thumbnail.height) // 2 + image_margin
-            if transparent_sheet:
-                sheet.alpha_composite(thumbnail, (tx, ty))
-            else:
-                tile_bg = Image.new("RGBA", thumbnail.size, (*bg_color, 255))
-                tile_bg.alpha_composite(thumbnail)
-                sheet.paste(tile_bg.convert("RGB"), (tx, ty))
-
-            # Cell outline makes the sheet visually structured.
-            draw.rectangle((x, y, x + cell_size - 1, y + cell_size - 1), outline=border, width=1)
-
-            if show_labels:
-                band_y = y + cell_size - label_height
-                draw.rectangle((x + 1, band_y, x + cell_size - 2, y + cell_size - 2), fill=label_band)
-                try:
-                    label = path.relative_to(folder).as_posix() if recursive else path.name
-                    label = f"{index:03d}  {label}"
-                    label = truncate_label(label, draw, font, cell_size - image_margin * 2)
-                except Exception:
-                    label = f"{index:03d}  [filename]"
-                draw.text((x + image_margin, band_y + 3), label, fill=label_ink, font=font)
-
-            placed += 1
+                width, height = source.size
+                if width <= 0 or height <= 0:
+                    skipped.append((path, "invalid image dimensions"))
+                    continue
+                if width * height > MAX_PIXELS:
+                    skipped.append((path, f"image exceeds {MAX_PIXELS:,}-pixel safety limit"))
+                    continue
+                source.load()  # Detect truncated/corrupt images before layout.
+            image_specs.append({"path": path, "size": (width, height)})
+            total_source_pixels += width * height
         except (OSError, ValueError, Image.DecompressionBombError) as exc:
             skipped.append((path, str(exc)))
         except Exception as exc:
             skipped.append((path, f"{type(exc).__name__}: {exc}"))
 
+    if not image_specs:
+        print("No readable PNG files could be used.")
+        for path, reason in skipped[:20]:
+            print(f"- {path.name}: {reason}")
+        return
+
+    if total_source_pixels > MAX_PIXELS:
+        print(
+            f"Error: The source images alone contain {total_source_pixels:,} pixels, "
+            f"exceeding the {MAX_PIXELS:,}-pixel output safety limit. "
+            "Split them into smaller folders/sheets."
+        )
+        return
+
+    print("\nLayout: each PNG keeps its exact original width and height.")
+    print("The output dimensions are calculated from source sizes, gaps, and optional labels.")
+    try:
+        raw_gap = input("Gap between images in pixels [8] (0-256): ").strip()
+        gap = 8 if raw_gap == "" else int(raw_gap)
+        if not 0 <= gap <= 256:
+            print("Gap must be between 0 and 256 pixels.")
+            return
+    except ValueError:
+        print("Please enter a valid whole number for the gap.")
+        return
+
+    labels_choice = ask_choice(
+        "Add filename labels below each image? (Y/n): ",
+        {"y": "yes", "Y": "yes", "n": "no", "N": "no", "": "yes"},
+        default="y",
+    )
+    show_labels = labels_choice.lower() != "n"
+    label_height = 26 if show_labels else 0
+
+    print("\nBackground:")
+    print("1. Transparent (preserves source alpha; recommended)")
+    print("2. Light gray")
+    print("3. White")
+    print("4. Dark gray")
+    bg_choice = ask_choice(
+        "Select background [1]: ",
+        {"1": "transparent", "2": "light", "3": "white", "4": "dark"},
+        default="1",
+    )
+    transparent_sheet = bg_choice == "1"
+    backgrounds = {
+        "2": (242, 242, 242),
+        "3": (255, 255, 255),
+        "4": (48, 48, 48),
+    }
+    bg_color = backgrounds.get(bg_choice)
+
+    # Use an outer margin equal to the inter-image gap; with gap=0 there is no margin.
+    padding = gap
+    layout = choose_compact_layout(image_specs, gap, padding, label_height)
+    if layout is None:
+        print(
+            "Error: Even the most compact candidate layout exceeds the "
+            f"{MAX_PIXELS:,}-pixel safety limit. Reduce labels/gaps or split the folder."
+        )
+        return
+
+    _, rows, (sheet_width, sheet_height), target_width = layout
+    if transparent_sheet:
+        sheet = Image.new("RGBA", (sheet_width, sheet_height), (0, 0, 0, 0))
+        label_band = (238, 238, 238, 235)
+        label_ink = (20, 20, 20, 255)
+        border = (150, 150, 150, 255)
+    else:
+        sheet = Image.new("RGB", (sheet_width, sheet_height), bg_color)
+        if bg_choice == "4":
+            label_band, label_ink, border = (65, 65, 65), (255, 255, 255), (125, 125, 125)
+        else:
+            label_band, label_ink, border = (225, 225, 225), (25, 25, 25), (175, 175, 175)
+
+    draw = ImageDraw.Draw(sheet)
+    font = load_font(14)
+    placed = 0
+    current_y = padding
+
+    for row_info in rows:
+        current_x = padding
+        for spec in row_info["items"]:
+            path = spec["path"]
+            width, height = spec["size"]
+            try:
+                with Image.open(path) as source:
+                    source.seek(0)
+                    # No resize, thumbnail, crop, or EXIF rotation: native pixel dimensions stay intact.
+                    asset = source.convert("RGBA")
+                    asset.load()
+
+                if asset.size != (width, height):
+                    skipped.append((path, "dimensions changed while processing; omitted"))
+                    current_x += width + gap
+                    continue
+
+                if transparent_sheet:
+                    # Direct paste preserves the asset's alpha channel on the transparent canvas.
+                    sheet.paste(asset, (current_x, current_y))
+                else:
+                    # Composite transparency onto the selected opaque background.
+                    sheet.paste(asset, (current_x, current_y), asset.getchannel("A"))
+
+                if show_labels:
+                    band_y = current_y + height
+                    draw.rectangle(
+                        (current_x, band_y, current_x + width - 1, band_y + label_height - 1),
+                        fill=label_band,
+                    )
+                    label = path.relative_to(folder).as_posix() if recursive else path.name
+                    label = truncate_label(label, draw, font, max(1, width - 8))
+                    if width > 12 and label:
+                        draw.text((current_x + 4, band_y + 5), label, fill=label_ink, font=font)
+
+                placed += 1
+            except (OSError, ValueError, Image.DecompressionBombError) as exc:
+                skipped.append((path, str(exc)))
+            except Exception as exc:
+                skipped.append((path, f"{type(exc).__name__}: {exc}"))
+            current_x += width + gap
+        current_y += row_info["height"] + gap
+
     if placed == 0:
-        print("No readable PNG files could be placed in the contact sheet.")
+        print("No images could be placed in the contact sheet.")
         return
 
     output_path = folder / "png_contact_sheet.png"
@@ -412,30 +543,35 @@ def create_contact_sheet():
         print(f"Could not save the contact sheet: {exc}")
         return
 
-    print("\n" + "=" * 48)
-    print("CONTACT SHEET CREATED")
+    print("\n" + "=" * 52)
+    print("NATIVE-SIZE CONTACT SHEET CREATED")
     print(f"Output: {output_path}")
-    print(f"PNG files found: {count}")
+    print(f"Readable source PNGs: {len(image_specs)}")
     print(f"Images placed: {placed}")
-    print(f"Skipped: {len(skipped)}")
-    print(f"Canvas: {sheet.width} x {sheet.height} pixels (square)")
-    print(f"Cell size: {cell_size} x {cell_size} pixels")
+    print(f"Skipped/unreadable: {len(skipped)}")
+    print(f"Canvas resolution: {sheet.width} x {sheet.height} pixels")
+    print(f"Layout target width: {target_width} pixels (used only to choose row breaks)")
+    print(f"Source pixels: {total_source_pixels:,} total; none were resized")
+    print(f"Labels: {'yes' if show_labels else 'no'}; gap: {gap}px")
     print(f"File size: {output_path.stat().st_size:,} bytes")
     if skipped:
         print("\nSkipped files:")
         for path, reason in skipped[:20]:
-            print(f"- {path.relative_to(folder)}: {reason}")
+            try:
+                display_path = path.relative_to(folder)
+            except ValueError:
+                display_path = path
+            print(f"- {display_path}: {reason}")
         if len(skipped) > 20:
             print(f"... and {len(skipped) - 20} more.")
-    print("=" * 48)
-
+    print("=" * 52)
 
 def main():
     print("=" * 46)
     print("        SMART PNG IMAGE PROCESSOR")
     print("=" * 46)
     print("1. Process / upscale one image")
-    print("2. Combine a folder of PNGs into one square artwork")
+    print("2. Combine PNGs at native sizes into one compact artwork")
     choice = ask_choice("\nSelect mode: ", {"1": "single", "2": "sheet"})
     if choice == "1":
         process_single_image()
